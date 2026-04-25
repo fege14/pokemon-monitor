@@ -1,0 +1,31 @@
+name: monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    # every 5 hours — each tick replaces the prior run via concurrency below
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: monitor
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m playwright install --with-deps chromium
+
+      - env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python monitor.py
