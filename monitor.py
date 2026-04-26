@@ -11,21 +11,37 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 
+# Each site declares the CSS selector and a regex (group 1 = the count number).
+# The Salling Group sites (Bilka/BR/Foetex) share the same magnolia-plp template;
+# WobblyNerdles is a Danish-language WooCommerce shop.
 SITES = [
     {
         "name": "Bilka",
         "url": "https://www.bilka.dk/brands/pokemon/pokemon-kort/pl/pokemon-kort/",
+        "selector": "div.count.flex",
+        "regex": r"(\d[\d.]*)\s+produkter",
         "unit": "produkter",
     },
     {
         "name": "BR",
         "url": "https://www.br.dk/maerker/o-aa/pokemon/pokemon-kort/pl/pokemon-kort/?p=0",
+        "selector": "div.count.flex",
+        "regex": r"(\d[\d.]*)\s+produkter",
         "unit": "produkter",
     },
     {
         "name": "Foetex",
         "url": "https://www.foetex.dk/brands/pokemon/pokemon-kort/pl/pokemon-kort/?p=0",
+        "selector": "div.count.flex",
+        "regex": r"(\d[\d.]*)\s+varer",
         "unit": "varer",
+    },
+    {
+        "name": "WobblyNerdles",
+        "url": "https://thewobblynerdles.dk/product-category/kortspil/pokemon/",
+        "selector": ".woocommerce-result-count",
+        "regex": r"af\s+(\d+)\s+resultater",
+        "unit": "resultater",
     },
 ]
 
@@ -33,11 +49,6 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-
-# All three sites share Salling Group's magnolia-plp template; the result
-# count sits inside `div.count.flex` within a sorting panel.
-COUNT_SELECTOR = "div.count.flex"
-PATTERN = re.compile(r"(\d[\d.]*)\s+(produkter|varer)", re.IGNORECASE)
 
 
 def log(msg):
@@ -80,34 +91,38 @@ def dismiss_consent(page):
     return False
 
 
+_FIND_TEXT_JS = """
+([sel, regexStr]) => {
+    const re = new RegExp(regexStr, 'i');
+    for (const el of document.querySelectorAll(sel)) {
+        const t = (el.innerText || '').trim();
+        if (re.test(t)) return t;
+    }
+    return null;
+}
+"""
+
+
 def read_count(page, site):
     page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
     dismiss_consent(page)
-    # wait for the count element to hydrate with "<digits> <unit>"
     page.wait_for_function(
-        f"""() => {{
-            const els = document.querySelectorAll('{COUNT_SELECTOR}');
-            for (const el of els) {{
-                const t = (el.innerText || '').trim();
-                if (/\\d+\\s+{site['unit']}/i.test(t)) return true;
-            }}
-            return false;
-        }}""",
+        "([sel, regexStr]) => {"
+        "  const re = new RegExp(regexStr, 'i');"
+        "  for (const el of document.querySelectorAll(sel)) {"
+        "    if (re.test((el.innerText || '').trim())) return true;"
+        "  }"
+        "  return false;"
+        "}",
+        arg=[site["selector"], site["regex"]],
         timeout=30_000,
     )
-    # take the first count element whose text actually matches the pattern
-    text = page.evaluate(
-        f"""() => {{
-            for (const el of document.querySelectorAll('{COUNT_SELECTOR}')) {{
-                const t = (el.innerText || '').trim();
-                if (/\\d+\\s+{site['unit']}/i.test(t)) return t;
-            }}
-            return '';
-        }}"""
-    )
-    m = PATTERN.search(text)
+    text = page.evaluate(_FIND_TEXT_JS, [site["selector"], site["regex"]])
+    if not text:
+        raise RuntimeError(f"selector matched nothing for {site['name']}")
+    m = re.search(site["regex"], text, re.IGNORECASE)
     if not m:
-        raise RuntimeError(f"no match in {text!r}")
+        raise RuntimeError(f"regex did not match in {text!r}")
     return int(m.group(1).replace(".", ""))
 
 
