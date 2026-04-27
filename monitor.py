@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import signal
 import sys
@@ -7,13 +8,18 @@ import time
 import requests
 from playwright.sync_api import sync_playwright
 
+# Resource types we don't need for reading the count text. Blocking these
+# cuts page weight ~80% and trims each cycle by several seconds.
+_BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
+# Random ± seconds added to each site's next-check time so polling is not
+# perfectly periodic (less obvious as automation to rate-limiters).
+_JITTER_SECONDS = 3
+
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 
-# Each site declares the CSS selector and a regex (group 1 = the count number).
-# The Salling Group sites (Bilka/BR/Foetex) share the same magnolia-plp template;
-# WobblyNerdles is a Danish-language WooCommerce shop.
+# Each site declares its CSS selector, a regex (group 1 = the count number),
+# and how often (seconds) it should be polled.
 SITES = [
     {
         "name": "Bilka",
@@ -21,6 +27,7 @@ SITES = [
         "selector": "div.count.flex",
         "regex": r"(\d[\d.]*)\s+produkter",
         "unit": "produkter",
+        "interval": 20,
     },
     {
         "name": "BR",
@@ -28,6 +35,7 @@ SITES = [
         "selector": "div.count.flex",
         "regex": r"(\d[\d.]*)\s+produkter",
         "unit": "produkter",
+        "interval": 20,
     },
     {
         "name": "Foetex",
@@ -35,6 +43,7 @@ SITES = [
         "selector": "div.count.flex",
         "regex": r"(\d[\d.]*)\s+varer",
         "unit": "varer",
+        "interval": 20,
     },
     {
         "name": "WobblyNerdles",
@@ -42,8 +51,15 @@ SITES = [
         "selector": ".woocommerce-result-count",
         "regex": r"af\s+(\d+)\s+resultater",
         "unit": "resultater",
+        "interval": 60,
     },
 ]
+
+# Optional dev override — set POLL_SECONDS=2 locally to make every site fast.
+_override = os.environ.get("POLL_SECONDS")
+if _override:
+    for _s in SITES:
+        _s["interval"] = int(_override)
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -147,19 +163,36 @@ def main():
             viewport={"width": 1366, "height": 900},
         )
         page = ctx.new_page()
-        log(f"started | sites={len(SITES)} interval={POLL_SECONDS}s")
+
+        def _route(route):
+            if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/*", _route)
+
+        intervals = " ".join(f"{s['name']}:{s['interval']}s" for s in SITES)
+        log(f"started | sites={len(SITES)} | {intervals}")
         notify(
             "Monitor started",
-            f"Polling {len(SITES)} sites every {POLL_SECONDS}s",
+            f"Polling {len(SITES)} sites ({intervals})",
             priority="low",
         )
 
+        next_check = {s["name"]: 0.0 for s in SITES}
         while not stop["flag"]:
             for site in SITES:
+                now = time.time()
+                if now < next_check[site["name"]]:
+                    continue
                 try:
                     count = read_count(page, site)
                 except Exception as e:
                     log(f"{site['name']}: error: {e}")
+                    next_check[site["name"]] = (
+                    time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
+                )
                     continue
 
                 prev = last[site["name"]]
@@ -176,11 +209,13 @@ def main():
                 else:
                     log(f"{site['name']}: {count} (no change)")
                 last[site["name"]] = count
+                next_check[site["name"]] = (
+                    time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
+                )
 
-            for _ in range(POLL_SECONDS):
-                if stop["flag"]:
-                    break
-                time.sleep(1)
+            if stop["flag"]:
+                break
+            time.sleep(1)
 
         browser.close()
     log("shutdown")
