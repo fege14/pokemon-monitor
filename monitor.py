@@ -28,6 +28,7 @@ SITES = [
         "regex": r"(\d[\d.]*)\s+produkter",
         "unit": "produkter",
         "interval": 20,
+        "items_root": "#products-row",
     },
     {
         "name": "BR",
@@ -36,6 +37,7 @@ SITES = [
         "regex": r"(\d[\d.]*)\s+produkter",
         "unit": "produkter",
         "interval": 20,
+        "items_root": "#products-row",
     },
     {
         "name": "Foetex",
@@ -44,6 +46,7 @@ SITES = [
         "regex": r"(\d[\d.]*)\s+varer",
         "unit": "varer",
         "interval": 20,
+        "items_root": "#products-row",
     },
     {
         "name": "WobblyNerdles",
@@ -52,6 +55,7 @@ SITES = [
         "regex": r"af\s+(\d+)\s+resultater",
         "unit": "resultater",
         "interval": 60,
+        # no items_root → count-only tracking
     },
 ]
 
@@ -118,8 +122,28 @@ _FIND_TEXT_JS = """
 }
 """
 
+# Walks the product grid and returns [{id, url, name}] for each card. Title
+# selector falls back across the two Salling layouts (Bilka/BR vs Foetex).
+_EXTRACT_ITEMS_JS = """
+(rootSel) => {
+    const root = document.querySelector(rootSel);
+    if (!root) return [];
+    const out = [];
+    for (const card of root.querySelectorAll('div[id^="product-"]')) {
+        const link = card.querySelector('a[href]');
+        const titleEl = card.querySelector('.v-card__title, .product-card__title');
+        out.push({
+            id: card.id,
+            url: link ? link.href : '',
+            name: titleEl ? (titleEl.innerText || '').trim() : '',
+        });
+    }
+    return out;
+}
+"""
 
-def read_count(page, site):
+
+def read_state(page, site):
     page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
     dismiss_consent(page)
     page.wait_for_function(
@@ -139,14 +163,24 @@ def read_count(page, site):
     m = re.search(site["regex"], text, re.IGNORECASE)
     if not m:
         raise RuntimeError(f"regex did not match in {text!r}")
-    return int(m.group(1).replace(".", ""))
+    count = int(m.group(1).replace(".", ""))
+
+    items = None
+    if site.get("items_root"):
+        page.wait_for_selector(
+            f'{site["items_root"]} div[id^="product-"]',
+            timeout=30_000,
+        )
+        items = page.evaluate(_EXTRACT_ITEMS_JS, site["items_root"])
+    return {"count": count, "items": items}
 
 
 def main():
     if not NTFY_TOPIC:
         log("WARN: NTFY_TOPIC not set — running in dry-run mode")
 
-    last = {s["name"]: None for s in SITES}
+    last_count = {s["name"]: None for s in SITES}
+    last_items = {s["name"]: None for s in SITES}
     stop = {"flag": False}
 
     def _stop(*_):
@@ -187,28 +221,63 @@ def main():
                 if now < next_check[site["name"]]:
                     continue
                 try:
-                    count = read_count(page, site)
+                    state = read_state(page, site)
                 except Exception as e:
                     log(f"{site['name']}: error: {e}")
                     next_check[site["name"]] = (
-                    time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
-                )
+                        time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
+                    )
                     continue
 
-                prev = last[site["name"]]
-                if prev is None:
-                    log(f"{site['name']}: baseline = {count} {site['unit']}")
-                elif count != prev:
-                    delta = count - prev
-                    arrow = "+" if delta > 0 else ""
-                    log(f"{site['name']}: {prev} -> {count} ({arrow}{delta})")
-                    notify(
-                        f"{site['name']}: {prev} -> {count}",
-                        f"{count} {site['unit']} ({arrow}{delta})\n{site['url']}",
-                    )
+                count = state["count"]
+                items = state["items"]
+                prev_count = last_count[site["name"]]
+                prev_items = last_items[site["name"]]
+
+                if items is not None:
+                    items_by_id = {it["id"]: it for it in items}
+                    if prev_items is None:
+                        log(f"{site['name']}: baseline = {count} {site['unit']} ({len(items_by_id)} items indexed)")
+                    else:
+                        added_ids = items_by_id.keys() - prev_items.keys()
+                        removed_ids = prev_items.keys() - items_by_id.keys()
+                        if added_ids or removed_ids:
+                            log(
+                                f"{site['name']}: {prev_count} -> {count} | "
+                                f"+{len(added_ids)} -{len(removed_ids)}"
+                            )
+                            for aid in added_ids:
+                                it = items_by_id[aid]
+                                name = it.get("name") or aid
+                                notify(
+                                    f"{site['name']} +ADDED",
+                                    f"{name}\n{it.get('url', '')}",
+                                )
+                            for rid in removed_ids:
+                                it = prev_items[rid]
+                                name = it.get("name") or rid
+                                notify(
+                                    f"{site['name']} -REMOVED",
+                                    f"{name}\n{it.get('url', '')}",
+                                )
+                        else:
+                            log(f"{site['name']}: {count} (no change, {len(items_by_id)} items)")
+                    last_items[site["name"]] = items_by_id
                 else:
-                    log(f"{site['name']}: {count} (no change)")
-                last[site["name"]] = count
+                    if prev_count is None:
+                        log(f"{site['name']}: baseline = {count} {site['unit']}")
+                    elif count != prev_count:
+                        delta = count - prev_count
+                        arrow = "+" if delta > 0 else ""
+                        log(f"{site['name']}: {prev_count} -> {count} ({arrow}{delta})")
+                        notify(
+                            f"{site['name']}: {prev_count} -> {count}",
+                            f"{count} {site['unit']} ({arrow}{delta})\n{site['url']}",
+                        )
+                    else:
+                        log(f"{site['name']}: {count} (no change)")
+
+                last_count[site["name"]] = count
                 next_check[site["name"]] = (
                     time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
                 )
