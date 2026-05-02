@@ -14,6 +14,10 @@ _BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 # Random ± seconds added to each site's next-check time so polling is not
 # perfectly periodic (less obvious as automation to rate-limiters).
 _JITTER_SECONDS = 3
+# Long-running Playwright sessions degrade — sockets pile up, the route
+# handler queue wedges, runner egress gets throttled. Recycling the browser
+# every 30min reliably clears all of that.
+_BROWSER_RECYCLE_SECONDS = 30 * 60
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -47,15 +51,6 @@ SITES = [
         "unit": "varer",
         "interval": 20,
         "items_root": "#products-row",
-    },
-    {
-        "name": "WobblyNerdles",
-        "url": "https://thewobblynerdles.dk/product-category/kortspil/pokemon/",
-        "selector": ".woocommerce-result-count",
-        "regex": r"af\s+(\d+)\s+resultater",
-        "unit": "resultater",
-        "interval": 60,
-        # no items_root → count-only tracking
     },
 ]
 
@@ -189,22 +184,26 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    def _route(route):
+        if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            route.abort()
+        else:
+            route.continue_()
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            user_agent=UA,
-            locale="da-DK",
-            viewport={"width": 1366, "height": 900},
-        )
-        page = ctx.new_page()
+        def _new_browser():
+            br = pw.chromium.launch(headless=True)
+            c = br.new_context(
+                user_agent=UA,
+                locale="da-DK",
+                viewport={"width": 1366, "height": 900},
+            )
+            p = c.new_page()
+            p.route("**/*", _route)
+            return br, c, p
 
-        def _route(route):
-            if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
-                route.abort()
-            else:
-                route.continue_()
-
-        page.route("**/*", _route)
+        browser, ctx, page = _new_browser()
+        browser_started = time.time()
 
         intervals = " ".join(f"{s['name']}:{s['interval']}s" for s in SITES)
         log(f"started | sites={len(SITES)} | {intervals}")
@@ -216,6 +215,15 @@ def main():
 
         next_check = {s["name"]: 0.0 for s in SITES}
         while not stop["flag"]:
+            if time.time() - browser_started > _BROWSER_RECYCLE_SECONDS:
+                log("recycling browser")
+                try:
+                    browser.close()
+                except Exception as e:
+                    log(f"browser close error: {e}")
+                browser, ctx, page = _new_browser()
+                browser_started = time.time()
+
             for site in SITES:
                 now = time.time()
                 if now < next_check[site["name"]]:
