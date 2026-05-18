@@ -28,6 +28,28 @@ jobs:
 
       - run: python -m playwright install --with-deps chromium
 
+      # State persists across runs so a fresh process doesn't silently
+      # baseline products added during the cancel→restart gap. Each run
+      # writes a uniquely-keyed cache; the next run's restore-keys prefix
+      # match picks up the most recent.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: |
+            monitor-state-
+
       - env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python monitor.py
+
+      # if: always() ensures state is saved even when the job is canceled
+      # by the next cron tick (cancel-in-progress). monitor.py also writes
+      # state.json on every sweep, so the file on disk is current.
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: monitor-state-${{ github.run_id }}

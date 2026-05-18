@@ -1,4 +1,6 @@
+import json
 import os
+import pathlib
 import random
 import re
 import signal
@@ -21,6 +23,13 @@ _BROWSER_RECYCLE_SECONDS = 30 * 60
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+
+# Persisted across process restarts. Without this, every fresh boot (e.g.
+# the 5h cron tick that kills the prior run via cancel-in-progress) would
+# silently baseline whatever's on the page — any product added during the
+# cancel→restart gap would be absorbed into the new baseline and never
+# trigger a notification.
+STATE_FILE = pathlib.Path(__file__).resolve().parent / "state.json"
 
 # Each site declares its CSS selector, a regex (group 1 = the count number),
 # and how often (seconds) it should be polled.
@@ -68,6 +77,39 @@ UA = (
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def load_state():
+    last_count = {s["name"]: None for s in SITES}
+    last_items = {s["name"]: None for s in SITES}
+    if not STATE_FILE.exists():
+        return last_count, last_items
+    try:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"state load failed, starting fresh: {e}")
+        return last_count, last_items
+    for s in SITES:
+        name = s["name"]
+        c = raw.get("last_count", {}).get(name)
+        if c is not None:
+            last_count[name] = c
+        i = raw.get("last_items", {}).get(name)
+        if i is not None:
+            last_items[name] = i
+    return last_count, last_items
+
+
+def save_state(last_count, last_items):
+    try:
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"last_count": last_count, "last_items": last_items}),
+            encoding="utf-8",
+        )
+        tmp.replace(STATE_FILE)
+    except Exception as e:
+        log(f"state save failed: {e}")
 
 
 def notify(title, message, priority="high", tags="bell"):
@@ -174,8 +216,16 @@ def main():
     if not NTFY_TOPIC:
         log("WARN: NTFY_TOPIC not set — running in dry-run mode")
 
-    last_count = {s["name"]: None for s in SITES}
-    last_items = {s["name"]: None for s in SITES}
+    last_count, last_items = load_state()
+    seeded = sum(1 for v in last_items.values() if v is not None)
+    if seeded:
+        sizes = ", ".join(
+            f"{name}:{len(v)}" for name, v in last_items.items() if v is not None
+        )
+        log(f"loaded state from {STATE_FILE.name} | {sizes}")
+    else:
+        log(f"no prior state at {STATE_FILE.name} — first poll will baseline silently")
+
     stop = {"flag": False}
 
     def _stop(*_):
@@ -190,111 +240,125 @@ def main():
         else:
             route.continue_()
 
-    with sync_playwright() as pw:
-        def _new_browser():
-            br = pw.chromium.launch(headless=True)
-            c = br.new_context(
-                user_agent=UA,
-                locale="da-DK",
-                viewport={"width": 1366, "height": 900},
-            )
-            p = c.new_page()
-            p.route("**/*", _route)
-            return br, c, p
+    intervals = " ".join(f"{s['name']}:{s['interval']}s" for s in SITES)
+    log(f"started | sites={len(SITES)} | {intervals}")
+    notify(
+        "Monitor started",
+        f"Polling {len(SITES)} sites ({intervals})",
+        priority="low",
+    )
+    next_check = {s["name"]: 0.0 for s in SITES}
 
-        browser, ctx, page = _new_browser()
-        browser_started = time.time()
+    session_attempt = 0
+    while not stop["flag"]:
+        session_attempt += 1
+        try:
+            with sync_playwright() as pw:
+                def _new_browser():
+                    br = pw.chromium.launch(headless=True)
+                    c = br.new_context(
+                        user_agent=UA,
+                        locale="da-DK",
+                        viewport={"width": 1366, "height": 900},
+                    )
+                    p = c.new_page()
+                    p.route("**/*", _route)
+                    return br, c, p
 
-        intervals = " ".join(f"{s['name']}:{s['interval']}s" for s in SITES)
-        log(f"started | sites={len(SITES)} | {intervals}")
-        notify(
-            "Monitor started",
-            f"Polling {len(SITES)} sites ({intervals})",
-            priority="low",
-        )
-
-        next_check = {s["name"]: 0.0 for s in SITES}
-        while not stop["flag"]:
-            if time.time() - browser_started > _BROWSER_RECYCLE_SECONDS:
-                log("recycling browser")
-                try:
-                    browser.close()
-                except Exception as e:
-                    log(f"browser close error: {e}")
                 browser, ctx, page = _new_browser()
                 browser_started = time.time()
 
-            for site in SITES:
-                now = time.time()
-                if now < next_check[site["name"]]:
-                    continue
-                try:
-                    state = read_state(page, site)
-                except Exception as e:
-                    log(f"{site['name']}: error: {e}")
-                    next_check[site["name"]] = (
-                        time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
-                    )
-                    continue
+                while not stop["flag"]:
+                    if time.time() - browser_started > _BROWSER_RECYCLE_SECONDS:
+                        log("recycling browser")
+                        try:
+                            browser.close()
+                        except Exception as e:
+                            log(f"browser close error: {e}")
+                        browser, ctx, page = _new_browser()
+                        browser_started = time.time()
 
-                count = state["count"]
-                items = state["items"]
-                prev_count = last_count[site["name"]]
-                prev_items = last_items[site["name"]]
-
-                if items is not None:
-                    items_by_id = {it["id"]: it for it in items}
-                    if prev_items is None:
-                        log(f"{site['name']}: baseline = {count} {site['unit']} ({len(items_by_id)} items indexed)")
-                    else:
-                        added_ids = items_by_id.keys() - prev_items.keys()
-                        removed_ids = prev_items.keys() - items_by_id.keys()
-                        if added_ids or removed_ids:
-                            log(
-                                f"{site['name']}: {prev_count} -> {count} | "
-                                f"+{len(added_ids)} -{len(removed_ids)}"
+                    for site in SITES:
+                        now = time.time()
+                        if now < next_check[site["name"]]:
+                            continue
+                        try:
+                            state = read_state(page, site)
+                        except Exception as e:
+                            log(f"{site['name']}: error: {e}")
+                            next_check[site["name"]] = (
+                                time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
                             )
-                            for aid in added_ids:
-                                it = items_by_id[aid]
-                                name = it.get("name") or aid
-                                notify(
-                                    f"{site['name']} +ADDED",
-                                    f"{name}\n{it.get('url', '')}",
-                                )
-                            for rid in removed_ids:
-                                it = prev_items[rid]
-                                name = it.get("name") or rid
-                                notify(
-                                    f"{site['name']} -REMOVED",
-                                    f"{name}\n{it.get('url', '')}",
-                                )
+                            continue
+
+                        count = state["count"]
+                        items = state["items"]
+                        prev_count = last_count[site["name"]]
+                        prev_items = last_items[site["name"]]
+
+                        if items is not None:
+                            items_by_id = {it["id"]: it for it in items}
+                            if prev_items is None:
+                                log(f"{site['name']}: baseline = {count} {site['unit']} ({len(items_by_id)} items indexed)")
+                            else:
+                                added_ids = items_by_id.keys() - prev_items.keys()
+                                removed_ids = prev_items.keys() - items_by_id.keys()
+                                if added_ids or removed_ids:
+                                    log(
+                                        f"{site['name']}: {prev_count} -> {count} | "
+                                        f"+{len(added_ids)} -{len(removed_ids)}"
+                                    )
+                                    for aid in added_ids:
+                                        it = items_by_id[aid]
+                                        name = it.get("name") or aid
+                                        notify(
+                                            f"{site['name']} +ADDED",
+                                            f"{name}\n{it.get('url', '')}",
+                                        )
+                                    for rid in removed_ids:
+                                        it = prev_items[rid]
+                                        name = it.get("name") or rid
+                                        notify(
+                                            f"{site['name']} -REMOVED",
+                                            f"{name}\n{it.get('url', '')}",
+                                        )
+                                else:
+                                    log(f"{site['name']}: {count} (no change, {len(items_by_id)} items)")
+                            last_items[site["name"]] = items_by_id
                         else:
-                            log(f"{site['name']}: {count} (no change, {len(items_by_id)} items)")
-                    last_items[site["name"]] = items_by_id
-                else:
-                    if prev_count is None:
-                        log(f"{site['name']}: baseline = {count} {site['unit']}")
-                    elif count != prev_count:
-                        delta = count - prev_count
-                        arrow = "+" if delta > 0 else ""
-                        log(f"{site['name']}: {prev_count} -> {count} ({arrow}{delta})")
-                        notify(
-                            f"{site['name']}: {prev_count} -> {count}",
-                            f"{count} {site['unit']} ({arrow}{delta})\n{site['url']}",
+                            if prev_count is None:
+                                log(f"{site['name']}: baseline = {count} {site['unit']}")
+                            elif count != prev_count:
+                                delta = count - prev_count
+                                arrow = "+" if delta > 0 else ""
+                                log(f"{site['name']}: {prev_count} -> {count} ({arrow}{delta})")
+                                notify(
+                                    f"{site['name']}: {prev_count} -> {count}",
+                                    f"{count} {site['unit']} ({arrow}{delta})\n{site['url']}",
+                                )
+                            else:
+                                log(f"{site['name']}: {count} (no change)")
+
+                        last_count[site["name"]] = count
+                        next_check[site["name"]] = (
+                            time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
                         )
-                    else:
-                        log(f"{site['name']}: {count} (no change)")
+                        save_state(last_count, last_items)
 
-                last_count[site["name"]] = count
-                next_check[site["name"]] = (
-                    time.time() + site["interval"] + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
-                )
+                    if stop["flag"]:
+                        break
+                    time.sleep(1)
 
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        except Exception as e:
             if stop["flag"]:
                 break
-            time.sleep(1)
+            log(f"session #{session_attempt} crashed, restarting in 10s: {type(e).__name__}: {e}")
+            time.sleep(10)
 
-        browser.close()
     log("shutdown")
 
 
