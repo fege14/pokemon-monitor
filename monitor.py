@@ -61,6 +61,21 @@ SITES = [
         "interval": 20,
         "items_root": "#products-row",
     },
+    {
+        # Proshop has no dedicated count element — the count phrase
+        # ("Produkter i din søgning: 21") sits inline in the page body,
+        # so we match against body and let the regex pull the number out.
+        # Cloudflare-protected; bundled chromium passes the challenge from
+        # residential IPs, GH-runner IPs are an unknown until deploy.
+        "name": "Proshop",
+        "url": "https://www.proshop.dk/pokemon-kort",
+        "selector": "body",
+        "regex": r"Produkter i din søgning:\s*(\d+)",
+        "unit": "produkter",
+        "interval": 30,
+        "items_root": ".site-productlist-container",
+        "extractor": "proshop",
+    },
 ]
 
 # Optional dev override — set POLL_SECONDS=2 locally to make every site fast.
@@ -152,8 +167,9 @@ _FIND_TEXT_JS = """
 ([sel, regexStr]) => {
     const re = new RegExp(regexStr, 'i');
     for (const el of document.querySelectorAll(sel)) {
-        const t = (el.innerText || '').trim();
-        if (re.test(t)) return t;
+        const t = (el.innerText || '');
+        const m = t.match(re);
+        if (m) return m[0];
     }
     return null;
 }
@@ -173,6 +189,40 @@ _EXTRACT_ITEMS_JS = """
             id: card.id,
             url: link ? link.href : '',
             name: titleEl ? (titleEl.innerText || '').trim() : '',
+        });
+    }
+    return out;
+}
+"""
+
+# Proshop's DOM is structurally different — no per-card id attribute; the
+# anchor's URL pathname is the stable per-product key. The text container
+# also includes badge labels ("NYHED") and a description blurb; we strip
+# leading badges and keep only the first real line as the title.
+_EXTRACT_ITEMS_PROSHOP_JS = r"""
+(rootSel) => {
+    const root = document.querySelector(rootSel);
+    if (!root) return [];
+    const out = [];
+    const BADGE = /^(NYHED|TILBUD|UDSALG|NEW|SALE)$/i;
+    for (const card of root.querySelectorAll('.site-productlist-item')) {
+        const link = card.querySelector('a.site-product-link') || card.querySelector('a[href]');
+        if (!link) continue;
+        const href = link.getAttribute('href') || '';
+        let id = href, url = href;
+        try {
+            const u = new URL(href, location.href);
+            id = u.pathname;
+            url = u.toString();
+        } catch (e) {}
+        const titleEl = card.querySelector('.site-productTextContainer');
+        const raw = titleEl ? (titleEl.innerText || '').trim() : '';
+        const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+        while (lines.length && BADGE.test(lines[0])) lines.shift();
+        out.push({
+            id: id,
+            url: url,
+            name: lines[0] || '',
         });
     }
     return out;
@@ -204,11 +254,18 @@ def read_state(page, site):
 
     items = None
     if site.get("items_root"):
-        page.wait_for_selector(
-            f'{site["items_root"]} div[id^="product-"]',
-            timeout=30_000,
-        )
-        items = page.evaluate(_EXTRACT_ITEMS_JS, site["items_root"])
+        if site.get("extractor") == "proshop":
+            page.wait_for_selector(
+                f'{site["items_root"]} .site-productlist-item',
+                timeout=30_000,
+            )
+            items = page.evaluate(_EXTRACT_ITEMS_PROSHOP_JS, site["items_root"])
+        else:
+            page.wait_for_selector(
+                f'{site["items_root"]} div[id^="product-"]',
+                timeout=30_000,
+            )
+            items = page.evaluate(_EXTRACT_ITEMS_JS, site["items_root"])
     return {"count": count, "items": items}
 
 
